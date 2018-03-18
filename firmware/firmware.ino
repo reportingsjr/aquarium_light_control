@@ -42,6 +42,9 @@
 
 #include "updateTime.h"
 
+#include <OneWire.h>
+#include <DallasTemperature.h>
+
 TimeChangeRule usEDT = {"EDT", Second, Sun, Mar, 2, -240};  //UTC - 4 hours
 TimeChangeRule usEST = {"EST", First, Sun, Nov, 2, -300};   //UTC - 5 hours
 Timezone usEastern(usEDT, usEST);
@@ -80,8 +83,9 @@ enum current_state_enum {
 };
 
 current_state_enum m_current_state = off_auto;
+current_state_enum m_current_auto_state = off_auto;
+current_state_enum m_current_manual_state = off_ha;
 
-boolean m_light_state = false;
 int m_light_brightness = 0;
 int m_max_light_brightness = 1023;
 
@@ -97,44 +101,38 @@ char m_msg_buffer[MSG_BUFFER_SIZE];
 WiFiClient wifiClient;
 PubSubClient client(wifiClient);
 
+// temperature sensor on pin D2
+OneWire oneWire(D2);
+DallasTemperature DS18B20(&oneWire);
 
 // function called to adapt the brightness and the state of the led
 void setLightState() {
-  if (m_light_state) {
     analogWrite(LIGHT_PIN, m_light_brightness);
     Serial.print("INFO: Brightness: ");
     Serial.println(m_light_brightness);
-  } else {
-    analogWrite(LIGHT_PIN, 0);
-    Serial.println("INFO: Turn light off");
-  }
 }
 
 // function called to publish the state of the led (on/off)
 void publishLightState() {
-  if (m_light_state) {
-    if(m_current_state == on_auto) {
+    if(m_current_auto_state == on_auto) {
       client.publish(MQTT_AUTO_LIGHT_STATE_TOPIC, LIGHT_ON, true);
-      client.publish(MQTT_MANUAL_LIGHT_STATE_TOPIC, LIGHT_OFF, true);
-    } else if(m_current_state == on_ha) {
+    } else {
+      client.publish(MQTT_AUTO_LIGHT_STATE_TOPIC, LIGHT_OFF, true);
+    }
+
+    if(m_current_manual_state == on_ha) {
       client.publish(MQTT_MANUAL_LIGHT_STATE_TOPIC, LIGHT_ON, true);
-      client.publish(MQTT_AUTO_LIGHT_STATE_TOPIC, LIGHT_OFF, true);
-    }
-  } else {
-    if(m_current_state == off_auto) {
-      client.publish(MQTT_AUTO_LIGHT_STATE_TOPIC, LIGHT_OFF, true);
-    } else if(m_current_state == off_ha) {
+    } else {
       client.publish(MQTT_MANUAL_LIGHT_STATE_TOPIC, LIGHT_OFF, true);
     }
-  }
 }
 
 // function called to publish the brightness of the led
 void publishLightBrightness() {
-  if(m_current_state == on_auto || m_current_state == off_auto) {
+  if(m_current_auto_state == on_auto) {
     snprintf(m_msg_buffer, MSG_BUFFER_SIZE, "%d", map(m_max_light_brightness, 0, 1023, 0, 255));
     client.publish(MQTT_AUTO_LIGHT_BRIGHTNESS_STATE_TOPIC, m_msg_buffer, true);
-  } else {
+  } else if (m_current_manual_state == on_ha) {
     snprintf(m_msg_buffer, MSG_BUFFER_SIZE, "%d", map(m_light_brightness, 0, 1023, 0, 255));
     client.publish(MQTT_MANUAL_LIGHT_BRIGHTNESS_STATE_TOPIC, m_msg_buffer, true);
   }
@@ -159,13 +157,12 @@ void callback(char* p_topic, byte* p_payload, unsigned int p_length) {
   if (String(MQTT_AUTO_LIGHT_COMMAND_TOPIC).equals(p_topic)) {
     // test if the payload is equal to "ON" or "OFF"
     if (payload.equals(String(LIGHT_ON))) {
-      m_current_state = on_auto;
-      m_light_state = true;
+      m_current_auto_state = on_auto;
+      m_current_manual_state = off_ha;
       setLightState();
       publishLightState();
     } else if (payload.equals(String(LIGHT_OFF))) {
-      m_current_state = off_auto;
-      m_light_state = false;
+      m_current_auto_state = off_auto;
       setLightState();
       publishLightState();
     }
@@ -182,18 +179,16 @@ void callback(char* p_topic, byte* p_payload, unsigned int p_length) {
   } else if (String(MQTT_MANUAL_LIGHT_COMMAND_TOPIC).equals(p_topic)) {
     // test if the payload is equal to "ON" or "OFF"
     if (payload.equals(String(LIGHT_ON))) {
-      m_current_state = on_ha;
-      m_light_state = true;
+      m_current_manual_state = on_ha;
+      m_current_auto_state = off_auto;
       setLightState();
       publishLightState();
     } else if (payload.equals(String(LIGHT_OFF))) {
-      m_current_state = off_ha;
-      m_light_state = false;
+      m_current_manual_state = off_ha;
       setLightState();
       publishLightState();
     }
   } else if (String(MQTT_MANUAL_LIGHT_BRIGHTNESS_COMMAND_TOPIC).equals(p_topic)) {
-    m_current_state = on_ha;
     uint8_t brightness = payload.toInt();
     if (brightness < 0 || brightness > 1023) {
       // do nothing...
@@ -213,7 +208,7 @@ void reconnect() {
     // Attempt to connect
     if (client.connect(MQTT_CLIENT_ID)) {
       Serial.println("\nINFO: connected");
-      
+
       // Once connected, publish an announcement...
       // publish the initial values
       publishLightState();
@@ -278,11 +273,14 @@ void setup ( void ) {
 
   analogWriteFreq(500);
   analogWrite(D1, m_light_brightness);
+
+  DS18B20.begin();
+  DS18B20.setResolution(11);
 }
 
 void state_machine() {
-  if(m_current_state == on_auto) {
-    float R = (pwmIntervals * log10(2))/(log10(m_max_light_brightness));
+  if(m_current_auto_state == on_auto) {
+    R = (pwmIntervals * log10(2))/(log10(m_max_light_brightness));
     // artificially increase the time by 15 mins ever loop to simulate faster days.
     time_t utc = now();// + timeWarp*900;
     time_t eastern = usEastern.toLocal(utc);
@@ -292,28 +290,28 @@ void state_machine() {
       float minutesSince7 = (hour(eastern) - 7)*60 + minute(eastern);
       m_light_brightness = pow(2, (minutesSince7 /  R)) - 1;
     }
-    if(hour(eastern) >= 10 && hour(eastern) < 17) {
+    if(hour(eastern) >= 10 && hour(eastern) < 19) {
       Serial.println("Peak brightness!");
       m_light_brightness = 1023;
     }
-    if(hour(eastern) >= 17 && hour(eastern) < 20) {
+    if(hour(eastern) >= 19 && hour(eastern) < 22) {
       // dim LEDs
       Serial.println("Getting dimmer!");
-      float minutesUntil8 = (20 - hour(eastern))*60 - minute(eastern);
-      m_light_brightness = pow(2, (minutesUntil8 / R)) - 1;
+      float minutesUntil10 = (22 - hour(eastern))*60 - minute(eastern);
+      m_light_brightness = pow(2, (minutesUntil10 / R)) - 1;
     }
-    if(hour(eastern) >= 20 || hour(eastern) < 7) {
+    if(hour(eastern) >= 22 || hour(eastern) < 7) {
       Serial.println("Peak darkness!");
       m_light_brightness = 0;
     }
     publishLightBrightness();
-  } else if(m_current_state == off_auto) {
-    // do nothing, because there isn't anything to do while we are off
-  } else if(m_current_state == on_ha) {
-    // do nothing, because there isn't anything to do while we are on from home assistant
-  } else if(m_current_state == off_ha) {
-    // do nothing, because there isn't anything to do while we are off from home assistant
+  } else if(m_current_manual_state == on_ha) {
+    // do nothing, because the brightness is set manually from home assistant
+  } else if(m_current_manual_state == off_ha && m_current_auto_state == off_auto ) {
+    // If both auto and manual are turned off then set the brightness to 0
+    m_light_brightness = 0;
   }
+  setLightState();
 }
 
 void loop ( void ) {
@@ -324,6 +322,10 @@ void loop ( void ) {
   }
   state_machine();
   client.loop();
+  DS18B20.requestTemperatures();
+  float temp = DS18B20.getTempCByIndex(0);
+  snprintf(m_msg_buffer, MSG_BUFFER_SIZE, "%d.%03d", (int)temp, (int)(temp*1000)%1000);
+  client.publish("aquarium/temperature", m_msg_buffer, true);
   delay(500);
 }
 
